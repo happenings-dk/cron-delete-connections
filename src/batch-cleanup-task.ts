@@ -49,32 +49,53 @@ export class BatchCleanupTask {
         }
     }
 
-
-    private async verifyCollections(db: any): Promise<boolean> {
-        this.logger.info('Verificando colecciones...');
+    private async verifyCollections(): Promise<boolean> {
+        this.logger.info('Verificando colecciones en todas las bases de datos...');
         try {
-            const collections = await db.listCollections().toArray();
-            const collectionNames = collections.map((c: { name: string }) => c.name);
-            this.logger.info('Colecciones encontradas:', collectionNames);
+            const dbUser = this.client.db('User');
+            const dbAccess = this.client.db('Access');
+            const dbOrganization = this.client.db('Organization');
 
-            const requiredCollections = {
-                'users': ['Users', 'User.Users', 'users'],
-                'identifications': ['Identifications'],
-                'deletedRequests': ['DeleteRequests'],
-                'deleted': ['Deleted']
-            };
+            // Obtener las colecciones de cada base de datos
+            const userCollections = await dbUser.listCollections().toArray();
+            const accessCollections = await dbAccess.listCollections().toArray();
+            const orgCollections = await dbOrganization.listCollections().toArray();
+
+            const userColNames = userCollections.map(c => c.name);
+            const accessColNames = accessCollections.map(c => c.name);
+            const orgColNames = orgCollections.map(c => c.name);
+
+            this.logger.info('Colecciones User:', userColNames);
+            this.logger.info('Colecciones Access:', accessColNames);
+            this.logger.info('Colecciones Organization:', orgColNames);
 
             let allFound = true;
 
-            for (const [key, alternatives] of Object.entries(requiredCollections)) {
-                const foundName = alternatives.find(name => collectionNames.includes(name));
-                if (foundName) {
-                    this.collectionNames.set(key, foundName);
-                    this.logger.info(`Colección ${key} encontrada como: ${foundName}`);
-                } else {
-                    allFound = false;
-                    this.logger.error(`No se encontró la colección ${key}`);
-                }
+            // Verificar Users en la base de datos User
+            if (userColNames.includes('Users')) {
+                this.collectionNames.set('users', 'Users');
+                this.logger.info('Colección Users encontrada en base de datos User');
+            } else {
+                allFound = false;
+                this.logger.error('No se encontró la colección Users en la base de datos User');
+            }
+
+            // Verificar Access en la base de datos Access
+            if (accessColNames.includes('Access')) {
+                this.collectionNames.set('accesses', 'Access');
+                this.logger.info('Colección Access encontrada en base de datos Access');
+            } else {
+                allFound = false;
+                this.logger.error('No se encontró la colección Access en la base de datos Access');
+            }
+
+            // Verificar Connections en la base de datos Organization
+            if (orgColNames.includes('Connections')) {
+                this.collectionNames.set('connections', 'Connections');
+                this.logger.info('Colección Connections encontrada en base de datos Organization');
+            } else {
+                allFound = false;
+                this.logger.error('No se encontró la colección Connections en la base de datos Organization');
             }
 
             return allFound;
@@ -90,12 +111,15 @@ export class BatchCleanupTask {
             await this.client.connect();
             this.logger.info('Conexión establecida exitosamente');
 
-            const dbUser = this.client.db('User');
-
-            const collectionsVerified = await this.verifyCollections(dbUser);
+            const collectionsVerified = await this.verifyCollections();
             if (!collectionsVerified) {
                 throw new Error('Fallo en la verificación de colecciones');
             }
+
+            const dbUser = this.client.db('User');
+            const dbAccess = this.client.db('Access');
+            const dbOrganization = this.client.db('Organization');
+            const dbUnilogin = this.client.db('Unilogin');
 
             const stats = {
                 totalProcessed: 0,
@@ -112,7 +136,7 @@ export class BatchCleanupTask {
                 batch.push(user);
 
                 if (batch.length >= this.BATCH_SIZE) {
-                    const batchStats = await this.processBatch(batch, dbUser);
+                    const batchStats = await this.processBatch(batch, dbAccess, dbOrganization, dbUnilogin);
                     this.updateStats(stats, batchStats);
                     batch = [];
 
@@ -121,9 +145,11 @@ export class BatchCleanupTask {
             }
 
             if (batch.length > 0) {
-                const batchStats = await this.processBatch(batch, dbUser);
+                const batchStats = await this.processBatch(batch, dbAccess, dbOrganization, dbUnilogin);
                 this.updateStats(stats, batchStats);
             }
+
+            await this.saveReportToFile();
 
             return {
                 success: true,
@@ -145,7 +171,9 @@ export class BatchCleanupTask {
 
     private async processBatch(
         users: any[],
-        dbUser: any
+        dbAccess: any,
+        dbOrganization: any,
+        dbUnilogin: any
     ): Promise<any> {
         const batchStats = {
             totalProcessed: 0,
@@ -168,35 +196,19 @@ export class BatchCleanupTask {
                 session.startTransaction();
 
                 try {
-                    const deleteRequestId = new Date().getTime() + '_' + user.id;
+                    const connection = await dbOrganization.collection('Connections')
+                        .findOne({ characterid: user.id }, { session });
 
-                    await dbUser.collection('DeleteRequests').insertOne({
-                        _id: deleteRequestId,
-                        userId: user.id,
-                        requestDate: new Date(),
-                        status: 'COMPLETED',
-                        reason: 'AUTOMATIC_CLEANUP',
-                        accessid: user.accessid || deleteRequestId,
-                        metadata: {
-                            originalUser: user,
-                            deletionDate: new Date(),
-                            deletionType: 'BATCH_CLEANUP'
-                        }
-                    }, { session });
+                    await dbAccess.collection('Access')
+                        .deleteOne({ characterid: user.id }, { session });
 
-                    await dbUser.collection('Deleted').insertOne({
-                        ...user,
-                        deletedAt: new Date(),
-                        deleteRequestId: deleteRequestId
-                    }, { session });
+                    await dbOrganization.collection('Connections')
+                        .deleteOne({ characterid: user.id }, { session });
 
-                    await dbUser.collection('Users').deleteOne({
-                        id: user.id
-                    }, { session });
-
-                    await dbUser.collection('Identifications').deleteMany({
-                        userId: user.id
-                    }, { session });
+                    if (connection?.method === 1) {
+                        await dbUnilogin.collection('Auth')
+                            .deleteMany({ userid: user.id }, { session });
+                    }
 
                     await session.commitTransaction();
                     await this.logDeletionResult(user.id, true);
