@@ -18,23 +18,23 @@ export class BatchCleanupTask {
         this.logFilePath = path.join(process.cwd(), 'deletion-report.txt');
     }
 
-    private async logDeletionResult(userId: string, wasDeleted: boolean, reason?: string) {
-        const status = wasDeleted ? 'ELIMINADO' : 'NO ELIMINADO';
+    private async logDeletionResult(userId: string, wasMarked: boolean, reason?: string) {
+        const status = wasMarked ? 'MARCADO' : 'NO MARCADO';
         const reasonText = reason ? ` - Razón: ${reason}` : '';
         this.deletionLog.push(`${status}: Usuario ID ${userId}${reasonText}`);
     }
 
     private async saveReportToFile() {
-        const deletedCount = this.deletionLog.filter(log => log.startsWith('ELIMINADO')).length;
-        const notDeletedCount = this.deletionLog.filter(log => log.startsWith('NO ELIMINADO')).length;
+        const markedCount = this.deletionLog.filter(log => log.startsWith('MARCADO')).length;
+        const notMarkedCount = this.deletionLog.filter(log => log.startsWith('NO MARCADO')).length;
 
         const report = [
-            '=== REPORTE DE LIMPIEZA DE USUARIOS ===',
+            '=== REPORTE DE MARCADO DE USUARIOS PARA ELIMINACIÓN ===',
             '',
             `Fecha de ejecución: ${new Date().toLocaleString()}`,
             '',
-            `Total usuarios eliminados: ${deletedCount}`,
-            `Total usuarios no eliminados: ${notDeletedCount}`,
+            `Total usuarios marcados: ${markedCount}`,
+            `Total usuarios no marcados: ${notMarkedCount}`,
             '',
             '=== DETALLE DE USUARIOS ===',
             '',
@@ -56,7 +56,6 @@ export class BatchCleanupTask {
             const dbAccess = this.client.db('Access');
             const dbOrganization = this.client.db('Organization');
 
-            // Obtener las colecciones de cada base de datos
             const userCollections = await dbUser.listCollections().toArray();
             const accessCollections = await dbAccess.listCollections().toArray();
             const orgCollections = await dbOrganization.listCollections().toArray();
@@ -71,7 +70,6 @@ export class BatchCleanupTask {
 
             let allFound = true;
 
-            // Verificar Users en la base de datos User
             if (userColNames.includes('Users')) {
                 this.collectionNames.set('users', 'Users');
                 this.logger.info('Colección Users encontrada en base de datos User');
@@ -80,7 +78,6 @@ export class BatchCleanupTask {
                 this.logger.error('No se encontró la colección Users en la base de datos User');
             }
 
-            // Verificar Access en la base de datos Access
             if (accessColNames.includes('Access')) {
                 this.collectionNames.set('accesses', 'Access');
                 this.logger.info('Colección Access encontrada en base de datos Access');
@@ -89,7 +86,6 @@ export class BatchCleanupTask {
                 this.logger.error('No se encontró la colección Access en la base de datos Access');
             }
 
-            // Verificar Connections en la base de datos Organization
             if (orgColNames.includes('Connections')) {
                 this.collectionNames.set('connections', 'Connections');
                 this.logger.info('Colección Connections encontrada en base de datos Organization');
@@ -123,8 +119,8 @@ export class BatchCleanupTask {
 
             const stats = {
                 totalProcessed: 0,
-                successfulDeletions: 0,
-                failedDeletions: 0,
+                successfulMarks: 0,
+                failedMarks: 0,
                 skippedUsers: 0
             };
 
@@ -155,8 +151,8 @@ export class BatchCleanupTask {
                 success: true,
                 stats,
                 message: `Proceso completado. Total procesados: ${stats.totalProcessed}, 
-                         Eliminados: ${stats.successfulDeletions}, 
-                         Fallidos: ${stats.failedDeletions}, 
+                         Marcados: ${stats.successfulMarks}, 
+                         Fallidos: ${stats.failedMarks}, 
                          Omitidos: ${stats.skippedUsers}`
             };
 
@@ -177,8 +173,8 @@ export class BatchCleanupTask {
     ): Promise<any> {
         const batchStats = {
             totalProcessed: 0,
-            successfulDeletions: 0,
-            failedDeletions: 0,
+            successfulMarks: 0,
+            failedMarks: 0,
             skippedUsers: 0
         };
 
@@ -196,30 +192,44 @@ export class BatchCleanupTask {
                 session.startTransaction();
 
                 try {
+                    const deletedAt = new Date();
                     const connection = await dbOrganization.collection('Connections')
                         .findOne({ characterid: user.id }, { session });
 
+                    // Actualizar en lugar de borrar
                     await dbAccess.collection('Access')
-                        .deleteOne({ characterid: user.id }, { session });
+                        .updateOne(
+                            { characterid: user.id },
+                            { $set: { deletedAt, status: 'deleted' } },
+                            { session }
+                        );
 
                     await dbOrganization.collection('Connections')
-                        .deleteOne({ characterid: user.id }, { session });
+                        .updateOne(
+                            { characterid: user.id },
+                            { $set: { deletedAt, status: 'deleted' } },
+                            { session }
+                        );
 
                     if (connection?.method === 1) {
                         await dbUnilogin.collection('Auth')
-                            .deleteMany({ userid: user.id }, { session });
+                            .updateMany(
+                                { userid: user.id },
+                                { $set: { deletedAt, status: 'deleted' } },
+                                { session }
+                            );
                     }
 
                     await session.commitTransaction();
                     await this.logDeletionResult(user.id, true);
-                    batchStats.successfulDeletions++;
-                    this.logger.info(`Usuario ${user.id} procesado exitosamente`);
+                    batchStats.successfulMarks++;
+                    this.logger.info(`Usuario ${user.id} marcado exitosamente`);
 
                 } catch (error) {
                     await session.abortTransaction();
                     await this.logDeletionResult(user.id, false, 'Error en la transacción');
                     this.logger.error(`Error procesando usuario ${user.id}:`, error);
-                    batchStats.failedDeletions++;
+                    batchStats.failedMarks++;
                 } finally {
                     await session.endSession();
                 }
@@ -227,7 +237,7 @@ export class BatchCleanupTask {
             } catch (error) {
                 await this.logDeletionResult(user.id, false, 'Error en el procesamiento');
                 this.logger.error(`Error procesando usuario ${user.id}:`, error);
-                batchStats.failedDeletions++;
+                batchStats.failedMarks++;
             }
         }
 
@@ -236,8 +246,8 @@ export class BatchCleanupTask {
 
     private updateStats(totalStats: any, batchStats: any): void {
         totalStats.totalProcessed += batchStats.totalProcessed;
-        totalStats.successfulDeletions += batchStats.successfulDeletions;
-        totalStats.failedDeletions += batchStats.failedDeletions;
+        totalStats.successfulMarks += batchStats.successfulMarks;
+        totalStats.failedMarks += batchStats.failedMarks;
         totalStats.skippedUsers += batchStats.skippedUsers;
     }
 
@@ -249,7 +259,7 @@ export class BatchCleanupTask {
             : user.endyear;
 
         if (!endYearValue) {
-            this.logger.info('No hay endyear definido, se debe eliminar');
+            this.logger.info('No hay endyear definido, se debe marcar');
             return true;
         }
 
@@ -257,7 +267,7 @@ export class BatchCleanupTask {
         const currentDate = new Date();
 
         if (endYear < currentDate) {
-            this.logger.info('La fecha de fin es anterior a la fecha actual, se debe eliminar');
+            this.logger.info('La fecha de fin es anterior a la fecha actual, se debe marcar');
             return true;
         }
 
@@ -265,7 +275,7 @@ export class BatchCleanupTask {
             (endYear.getMonth() === 6 && endYear.getDate() >= 7);
 
         if (endYear.getFullYear() === currentDate.getFullYear() && isAfterJuly7th) {
-            this.logger.info('Es el año actual y después del 7 de julio, se debe eliminar');
+            this.logger.info('Es el año actual y después del 7 de julio, se debe marcar');
             return true;
         }
 
