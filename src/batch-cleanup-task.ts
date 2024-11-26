@@ -5,7 +5,8 @@ import * as path from 'path';
 
 export class BatchCleanupTask {
     private readonly logger: Logger;
-    private readonly mongoUri = 'mongodb+srv://feridem:zZCLTCIGpcH2RedN@cluster0.ynd5zaq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+    // private readonly mongoUri = 'mongodb+srv://feridem:zZCLTCIGpcH2RedN@cluster0.ynd5zaq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+    private readonly mongoUri = 'mongodb://localhost:27017';
     private collectionNames: Map<string, string> = new Map();
     private client: MongoClient;
     private readonly BATCH_SIZE = 5000;
@@ -115,7 +116,6 @@ export class BatchCleanupTask {
             const dbUser = this.client.db('User');
             const dbAccess = this.client.db('Access');
             const dbOrganization = this.client.db('Organization');
-            const dbUnilogin = this.client.db('Unilogin');
 
             const stats = {
                 totalProcessed: 0,
@@ -124,7 +124,8 @@ export class BatchCleanupTask {
                 skippedUsers: 0
             };
 
-            const usersCursor = dbUser.collection('Users').find({});
+            const usersCursor = dbUser.collection('Users')
+                .find({});
 
             let batch: any[] = [];
             while (await usersCursor.hasNext()) {
@@ -132,16 +133,16 @@ export class BatchCleanupTask {
                 batch.push(user);
 
                 if (batch.length >= this.BATCH_SIZE) {
-                    const batchStats = await this.processBatch(batch, dbAccess, dbOrganization, dbUnilogin);
+                    const batchStats = await this.processBatch(batch, dbAccess, dbOrganization);
                     this.updateStats(stats, batchStats);
                     batch = [];
 
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                 }
             }
 
             if (batch.length > 0) {
-                const batchStats = await this.processBatch(batch, dbAccess, dbOrganization, dbUnilogin);
+                const batchStats = await this.processBatch(batch, dbAccess, dbOrganization);
                 this.updateStats(stats, batchStats);
             }
 
@@ -169,7 +170,6 @@ export class BatchCleanupTask {
         users: any[],
         dbAccess: any,
         dbOrganization: any,
-        dbUnilogin: any
     ): Promise<any> {
         const batchStats = {
             totalProcessed: 0,
@@ -188,50 +188,40 @@ export class BatchCleanupTask {
                     continue;
                 }
 
-                const session = await this.client.startSession();
-                session.startTransaction();
-
                 try {
-                    const deletedAt = new Date();
-                    const connection = await dbOrganization.collection('Connections')
-                        .findOne({ characterid: user.id }, { session });
 
-                    // Actualizar en lugar de borrar
                     await dbAccess.collection('Access')
                         .updateOne(
                             { characterid: user.id },
-                            { $set: { deletedAt, status: 'deleted' } },
-                            { session }
+                            {
+                                $set: {
+                                    type: 6,
+                                    isActive: true,
+                                }
+                            }
                         );
 
                     await dbOrganization.collection('Connections')
                         .updateOne(
                             { characterid: user.id },
-                            { $set: { deletedAt, status: 'deleted' } },
-                            { session }
+                            {
+                                $set: {
+                                    deactivatedAt: new Date(),
+                                    isActive: true,
+                                }
+                            }
                         );
 
-                    if (connection?.method === 1) {
-                        await dbUnilogin.collection('Auth')
-                            .updateMany(
-                                { userid: user.id },
-                                { $set: { deletedAt, status: 'deleted' } },
-                                { session }
-                            );
-                    }
 
-                    await session.commitTransaction();
+
                     await this.logDeletionResult(user.id, true);
                     batchStats.successfulMarks++;
                     this.logger.info(`Usuario ${user.id} marcado exitosamente`);
 
                 } catch (error) {
-                    await session.abortTransaction();
-                    await this.logDeletionResult(user.id, false, 'Error en la transacción');
+                    await this.logDeletionResult(user.id, false, 'Error en la actualización');
                     this.logger.error(`Error procesando usuario ${user.id}:`, error);
                     batchStats.failedMarks++;
-                } finally {
-                    await session.endSession();
                 }
 
             } catch (error) {
